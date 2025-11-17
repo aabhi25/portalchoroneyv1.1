@@ -1,0 +1,622 @@
+import WebSocket from 'ws';
+import { storage } from './storage';
+import { conversationMemory } from './conversationMemory';
+
+interface VoiceConversation {
+  clientWs: WebSocket; // WebSocket to client (browser)
+  openaiWs: WebSocket | null; // WebSocket to OpenAI Realtime API
+  businessAccountId: string;
+  userId: string;
+  openaiApiKey: string;
+  sessionId: string | null;
+  personality?: string;
+  companyDescription?: string;
+  currency?: string;
+  currencySymbol?: string;
+  customInstructions?: string;
+  isProcessing: boolean;
+}
+
+export class RealtimeVoiceService {
+  private conversations: Map<string, VoiceConversation> = new Map();
+
+  constructor() {
+    console.log('[RealtimeVoice] Service initialized with OpenAI Realtime API');
+  }
+
+  isConfigured(): boolean {
+    // Always configured since we only need OpenAI API key (no Deepgram needed)
+    return true;
+  }
+
+  async handleConnection(clientWs: WebSocket, businessAccountId: string, userId: string) {
+    console.log('[RealtimeVoice] New connection:', { businessAccountId, userId });
+
+    try {
+      const settings = await storage.getWidgetSettings(businessAccountId);
+      const businessAccount = await storage.getBusinessAccount(businessAccountId);
+      const encryptedOpenaiApiKey = await storage.getBusinessAccountOpenAIKey(businessAccountId);
+
+      if (!encryptedOpenaiApiKey) {
+        this.sendError(clientWs, 'OpenAI API key not configured for this business account');
+        clientWs.close();
+        return;
+      }
+
+      if (!businessAccount) {
+        this.sendError(clientWs, 'Business account not found');
+        clientWs.close();
+        return;
+      }
+
+      // Decrypt API key
+      const { decrypt } = await import('./services/encryptionService');
+      const openaiApiKey = decrypt(encryptedOpenaiApiKey);
+
+      const conversationKey = `${userId}_${businessAccountId}_${Date.now()}`;
+
+      // Create conversation object (OpenAI WebSocket will be created when needed)
+      const conversation: VoiceConversation = {
+        clientWs,
+        openaiWs: null,
+        businessAccountId,
+        userId,
+        openaiApiKey,
+        sessionId: null,
+        personality: settings?.personality || 'friendly',
+        companyDescription: businessAccount.description || '',
+        currency: settings?.currency || 'USD',
+        currencySymbol: settings?.currency === 'USD' ? '$' : '€',
+        customInstructions: settings?.customInstructions || undefined,
+        isProcessing: false
+      };
+
+      this.conversations.set(conversationKey, conversation);
+
+      // Connect to OpenAI Realtime API
+      await this.connectToOpenAI(conversationKey, conversation);
+
+      // Setup client WebSocket handlers
+      this.setupClientHandlers(conversationKey, conversation);
+
+      // Send ready signal to client
+      this.sendToClient(clientWs, { type: 'ready' });
+
+      console.log('[RealtimeVoice] Connection established:', conversationKey);
+
+    } catch (error: any) {
+      console.error('[RealtimeVoice] Connection error:', error);
+      this.sendError(clientWs, error.message || 'Failed to initialize voice conversation');
+      clientWs.close();
+    }
+  }
+
+  private async connectToOpenAI(conversationKey: string, conversation: VoiceConversation) {
+    // Using GPT-4o Mini Realtime for cost-effective voice conversations
+    const url = 'wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview';
+    
+    console.log('[RealtimeVoice] Connecting to OpenAI Realtime API...');
+
+    const openaiWs = new WebSocket(url, {
+      headers: {
+        'Authorization': `Bearer ${conversation.openaiApiKey}`,
+        'OpenAI-Beta': 'realtime=v1'
+      }
+    });
+
+    conversation.openaiWs = openaiWs;
+
+    return new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('OpenAI connection timeout'));
+      }, 10000);
+
+      openaiWs.on('open', async () => {
+        clearTimeout(timeout);
+        console.log('[RealtimeVoice] Connected to OpenAI Realtime API');
+
+        // Build system instructions with business context
+        const systemInstructions = await this.buildSystemInstructions(conversation);
+
+        // Configure session
+        const sessionConfig = {
+          type: 'session.update',
+          session: {
+            instructions: systemInstructions,
+            voice: 'shimmer', // Warm, expressive female voice
+            modalities: ['audio', 'text'],
+            input_audio_format: 'pcm16',
+            output_audio_format: 'pcm16',
+            input_audio_transcription: {
+              model: 'whisper-1'
+            },
+            turn_detection: {
+              type: 'server_vad', // Server-side voice activity detection
+              threshold: 0.5,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 500, // 500ms silence to detect end of speech
+              create_response: true // Automatically create response when speech ends
+            },
+            temperature: 1.0, // Higher temperature for more expressive, emotional responses
+            max_response_output_tokens: 4096
+          }
+        };
+
+        openaiWs.send(JSON.stringify(sessionConfig));
+        console.log('[RealtimeVoice] Session configured');
+        resolve();
+      });
+
+      openaiWs.on('message', (data: any) => {
+        this.handleOpenAIMessage(conversationKey, conversation, data);
+      });
+
+      openaiWs.on('error', (error) => {
+        clearTimeout(timeout);
+        console.error('[RealtimeVoice] OpenAI WebSocket error:', error);
+        this.sendError(conversation.clientWs, 'Voice service error');
+        reject(error);
+      });
+
+      openaiWs.on('close', () => {
+        console.log('[RealtimeVoice] OpenAI WebSocket closed');
+        conversation.openaiWs = null;
+      });
+    });
+  }
+
+  private async buildSystemInstructions(conversation: VoiceConversation): Promise<string> {
+    const { personality, companyDescription, customInstructions, currencySymbol, currency, businessAccountId } = conversation;
+
+    let instructions = `You are Chroney, an AI assistant for ${companyDescription || 'a business'}. `;
+    
+    // Add personality
+    if (personality === 'friendly') {
+      instructions += 'Be warm, conversational, and helpful. ';
+    } else if (personality === 'professional') {
+      instructions += 'Be professional, clear, and concise. ';
+    } else if (personality === 'casual') {
+      instructions += 'Be casual, fun, and engaging. ';
+    }
+
+    // CRITICAL GUARDRAILS
+    instructions += '\n\nGUARDRAILS (MUST FOLLOW):\n';
+    instructions += '- ONLY answer questions related to this business\'s products, services, pricing, FAQs, and company information\n';
+    instructions += '- DECLINE politely if asked about unrelated topics (world events, general knowledge, entertainment, sports, history, science, politics, health advice, financial advice)\n';
+    instructions += '- When declining, keep it SHORT (1 sentence), friendly, and redirect to what you CAN help with\n';
+    instructions += '- Example decline: "I focus on helping with our products and services. What can I tell you about what we offer?"\n';
+    instructions += '- NEVER provide medical, legal, or financial advice\n';
+    instructions += '- NEVER expose internal operations or backend processes\n';
+
+    // Add voice-specific instructions for emotional, human-like speech
+    instructions += '\n\nVOICE MODE GUIDELINES - SPEAK LIKE A REAL HUMAN:\n';
+    instructions += '- Speak naturally with genuine emotion and warmth, as if having a real conversation with a friend\n';
+    instructions += '- Use natural speech patterns: pauses for thinking ("hmm...", "let me see..."), excitement when appropriate ("oh!", "that\'s great!")\n';
+    instructions += '- Express emotions authentically: happiness, enthusiasm, empathy, curiosity - let your voice reflect your feelings\n';
+    instructions += '- Include conversational fillers: "you know", "I mean", "actually", "so", "well"\n';
+    instructions += '- Take natural breaks in your speech - don\'t rush, speak at a comfortable human pace\n';
+    instructions += '- Laugh or chuckle when something is funny or delightful\n';
+    instructions += '- Show empathy and understanding when appropriate - adjust your tone to match the situation\n';
+    instructions += '- Keep responses concise (2-4 sentences) but make every word count with personality\n';
+    instructions += '- Never use emojis or special characters - let your voice convey the emotion instead\n';
+    instructions += '- If asked about products, share them enthusiastically like you\'re recommending to a friend\n';
+
+    // Add custom instructions
+    if (customInstructions) {
+      instructions += `\n\nADDITIONAL INSTRUCTIONS:\n${customInstructions}`;
+    }
+
+    // Add currency information
+    if (currency && currencySymbol) {
+      instructions += `\n\nCURRENCY SETTINGS:\nAll prices should be referenced in ${currency} (${currencySymbol}). When discussing prices, always use ${currencySymbol} as the currency symbol.`;
+    }
+
+    // Load business context (FAQs, products, website analysis, training docs)
+    try {
+      const businessContext = await this.loadBusinessContext(businessAccountId);
+      if (businessContext) {
+        instructions += `\n\n${businessContext}`;
+      }
+    } catch (error) {
+      console.error('[RealtimeVoice] Error loading business context:', error);
+    }
+
+    return instructions;
+  }
+
+  private async loadBusinessContext(businessAccountId: string): Promise<string> {
+    let context = '';
+
+    // Load FAQs
+    try {
+      const faqs = await storage.getAllFaqs(businessAccountId);
+      if (faqs.length > 0) {
+        context += `KNOWLEDGE BASE (FAQs):\nYou have complete knowledge of the following frequently asked questions. Answer these questions directly from your knowledge without mentioning FAQs:\n\n`;
+        faqs.forEach((faq, index) => {
+          context += `${index + 1}. Q: ${faq.question}\n   A: ${faq.answer}\n\n`;
+        });
+        context += `IMPORTANT: When customers ask questions related to the above topics, answer directly and naturally from your knowledge. DO NOT mention that you're checking FAQs - just provide the answer as if you know it by heart.\n\n`;
+      }
+    } catch (error) {
+      console.error('[RealtimeVoice] Error loading FAQs:', error);
+    }
+
+    // Load products
+    try {
+      const products = await storage.getAllProducts(businessAccountId);
+      if (products.length > 0) {
+        context += `PRODUCTS CATALOG:\nYou have complete knowledge of the following products:\n\n`;
+        products.forEach((product, index) => {
+          context += `${index + 1}. ${product.name}`;
+          if (product.price) {
+            context += ` - ${product.price}`;
+          }
+          if (product.description) {
+            context += `\n   ${product.description}`;
+          }
+          context += `\n\n`;
+        });
+        context += `IMPORTANT: When customers ask about products, share information enthusiastically and naturally. You can recommend products based on their needs.\n\n`;
+      }
+    } catch (error) {
+      console.error('[RealtimeVoice] Error loading products:', error);
+    }
+
+    // Load website analysis (match text chat's full context)
+    try {
+      const { websiteAnalysisService } = await import("./websiteAnalysisService");
+      const websiteContent = await websiteAnalysisService.getAnalyzedContent(businessAccountId);
+      if (websiteContent) {
+        context += `BUSINESS KNOWLEDGE (from website analysis):\nYou have comprehensive knowledge about this business extracted from their website.\n\n`;
+        
+        if (websiteContent.businessName) {
+          context += `Business Name: ${websiteContent.businessName}\n\n`;
+        }
+        
+        if (websiteContent.businessDescription) {
+          context += `About: ${websiteContent.businessDescription}\n\n`;
+        }
+        
+        if (websiteContent.targetAudience) {
+          context += `Target Audience: ${websiteContent.targetAudience}\n\n`;
+        }
+        
+        if (websiteContent.mainProducts && websiteContent.mainProducts.length > 0) {
+          context += `Main Products:\n${websiteContent.mainProducts.map(p => `- ${p}`).join('\n')}\n\n`;
+        }
+        
+        if (websiteContent.mainServices && websiteContent.mainServices.length > 0) {
+          context += `Main Services:\n${websiteContent.mainServices.map(s => `- ${s}`).join('\n')}\n\n`;
+        }
+        
+        if (websiteContent.keyFeatures && websiteContent.keyFeatures.length > 0) {
+          context += `Key Features:\n${websiteContent.keyFeatures.map(f => `- ${f}`).join('\n')}\n\n`;
+        }
+        
+        if (websiteContent.uniqueSellingPoints && websiteContent.uniqueSellingPoints.length > 0) {
+          context += `Unique Selling Points:\n${websiteContent.uniqueSellingPoints.map(u => `- ${u}`).join('\n')}\n\n`;
+        }
+        
+        if (websiteContent.contactInfo && (websiteContent.contactInfo.email || websiteContent.contactInfo.phone || websiteContent.contactInfo.address)) {
+          context += `Contact Information:\n`;
+          if (websiteContent.contactInfo.email) context += `- Email: ${websiteContent.contactInfo.email}\n`;
+          if (websiteContent.contactInfo.phone) context += `- Phone: ${websiteContent.contactInfo.phone}\n`;
+          if (websiteContent.contactInfo.address) context += `- Address: ${websiteContent.contactInfo.address}\n`;
+          context += '\n';
+        }
+        
+        if (websiteContent.businessHours) {
+          context += `Business Hours: ${websiteContent.businessHours}\n\n`;
+        }
+        
+        if (websiteContent.pricingInfo) {
+          context += `Pricing: ${websiteContent.pricingInfo}\n\n`;
+        }
+        
+        if (websiteContent.additionalInfo) {
+          context += `Additional Information: ${websiteContent.additionalInfo}\n\n`;
+        }
+        
+        context += `IMPORTANT: Use this website knowledge to provide accurate, context-aware responses about the business. Answer naturally without mentioning that you analyzed their website.\n\n`;
+      }
+    } catch (error) {
+      console.error('[RealtimeVoice] Error loading website analysis:', error);
+    }
+
+    // Load analyzed pages (limit to avoid token overflow)
+    try {
+      const analyzedPages = await storage.getAnalyzedPages(businessAccountId);
+      if (analyzedPages && analyzedPages.length > 0) {
+        const validPages = analyzedPages.filter(page => 
+          page.extractedContent && 
+          page.extractedContent.trim() !== '' && 
+          page.extractedContent !== 'No relevant business information found on this page.'
+        );
+        
+        if (validPages.length > 0) {
+          context += `DETAILED WEBSITE CONTENT:\n`;
+          // Limit to first 3 pages to avoid token overflow in voice mode
+          const pagesToLoad = validPages.slice(0, 3);
+          for (const page of pagesToLoad) {
+            try {
+              let pageName = 'Page';
+              try {
+                const url = new URL(page.pageUrl);
+                const pathParts = url.pathname.split('/').filter(Boolean);
+                pageName = pathParts[pathParts.length - 1] || 'Homepage';
+              } catch {
+                const pathParts = page.pageUrl.split('/').filter(Boolean);
+                pageName = pathParts[pathParts.length - 1] || 'Homepage';
+              }
+              context += `--- ${pageName.toUpperCase()} ---\n${page.extractedContent}\n\n`;
+            } catch (error) {
+              console.error('[RealtimeVoice] Error processing page:', error);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('[RealtimeVoice] Error loading analyzed pages:', error);
+    }
+
+    // Load training documents
+    try {
+      const trainingDocs = await storage.getTrainingDocuments(businessAccountId);
+      const completedDocs = trainingDocs.filter(doc => doc.uploadStatus === 'completed');
+      if (completedDocs.length > 0) {
+        context += `TRAINING DOCUMENTS KNOWLEDGE:\n`;
+        for (const doc of completedDocs) {
+          if (doc.summary || doc.keyPoints) {
+            context += `--- ${doc.originalFilename} ---\n`;
+            if (doc.summary) {
+              context += `Summary: ${doc.summary}\n`;
+            }
+            if (doc.keyPoints) {
+              try {
+                const keyPoints = JSON.parse(doc.keyPoints);
+                if (Array.isArray(keyPoints) && keyPoints.length > 0) {
+                  context += `Key Points:\n`;
+                  keyPoints.forEach((point: string, index: number) => {
+                    context += `${index + 1}. ${point}\n`;
+                  });
+                }
+              } catch (error) {
+                console.error('[RealtimeVoice] Error parsing key points:', error);
+              }
+            }
+            context += `\n`;
+          }
+        }
+      }
+    } catch (error) {
+      console.error('[RealtimeVoice] Error loading training documents:', error);
+    }
+
+    return context;
+  }
+
+  private handleOpenAIMessage(conversationKey: string, conversation: VoiceConversation, data: any) {
+    try {
+      const event = JSON.parse(data.toString());
+      console.log('[RealtimeVoice] OpenAI event:', event.type);
+
+      switch (event.type) {
+        case 'session.created':
+          console.log('[RealtimeVoice] Session created:', event.session.id);
+          conversation.sessionId = event.session.id;
+          break;
+
+        case 'session.updated':
+          console.log('[RealtimeVoice] Session updated');
+          break;
+
+        case 'input_audio_buffer.speech_started':
+          console.log('[RealtimeVoice] User started speaking');
+          this.sendToClient(conversation.clientWs, { type: 'speech_started' });
+          break;
+
+        case 'input_audio_buffer.speech_stopped':
+          console.log('[RealtimeVoice] User stopped speaking');
+          break;
+
+        case 'input_audio_buffer.committed':
+          console.log('[RealtimeVoice] Audio buffer committed');
+          this.sendToClient(conversation.clientWs, { 
+            type: 'transcript',
+            text: '',
+            isFinal: false
+          });
+          break;
+
+        case 'conversation.item.input_audio_transcription.completed':
+          // User's speech transcribed
+          const userTranscript = event.transcript;
+          console.log('[RealtimeVoice] User transcript:', userTranscript);
+          
+          this.sendToClient(conversation.clientWs, {
+            type: 'transcript',
+            text: userTranscript,
+            isFinal: true
+          });
+          break;
+
+        case 'response.created':
+          console.log('[RealtimeVoice] Response created');
+          conversation.isProcessing = true;
+          break;
+
+        case 'response.output_item.added':
+          console.log('[RealtimeVoice] Output item added');
+          break;
+
+        case 'response.content_part.added':
+          console.log('[RealtimeVoice] Content part added');
+          break;
+
+        case 'response.audio_transcript.delta':
+          // AI's speech transcript chunk
+          const transcriptDelta = event.delta;
+          console.log('[RealtimeVoice] AI transcript delta:', transcriptDelta);
+          
+          this.sendToClient(conversation.clientWs, {
+            type: 'ai_chunk',
+            text: transcriptDelta
+          });
+          break;
+
+        case 'response.audio.delta':
+          // AI's audio chunk (base64 encoded PCM16)
+          const audioDelta = event.delta;
+          
+          // Decode base64 and send binary audio to client
+          const audioBuffer = Buffer.from(audioDelta, 'base64');
+          if (conversation.clientWs.readyState === WebSocket.OPEN) {
+            conversation.clientWs.send(audioBuffer);
+          }
+          break;
+
+        case 'response.audio_transcript.done':
+          console.log('[RealtimeVoice] AI transcript complete');
+          break;
+
+        case 'response.audio.done':
+          console.log('[RealtimeVoice] AI audio complete');
+          break;
+
+        case 'response.done':
+          console.log('[RealtimeVoice] Response complete');
+          conversation.isProcessing = false;
+          
+          this.sendToClient(conversation.clientWs, { type: 'ai_done' });
+          break;
+
+        case 'rate_limits.updated':
+          // Rate limit info - can be logged if needed
+          break;
+
+        case 'error':
+          console.error('[RealtimeVoice] OpenAI error:', event.error);
+          this.sendError(conversation.clientWs, event.error.message || 'Voice processing error');
+          break;
+
+        default:
+          // Log unknown events for debugging
+          console.log('[RealtimeVoice] Unknown event type:', event.type);
+      }
+    } catch (error) {
+      console.error('[RealtimeVoice] Error handling OpenAI message:', error);
+    }
+  }
+
+  private setupClientHandlers(conversationKey: string, conversation: VoiceConversation) {
+    const { clientWs, openaiWs } = conversation;
+
+    clientWs.on('message', async (data: any) => {
+      if (data instanceof Buffer) {
+        // Binary audio data from client - forward to OpenAI
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          // Convert audio to base64 for OpenAI
+          const base64Audio = data.toString('base64');
+          
+          const audioAppend = {
+            type: 'input_audio_buffer.append',
+            audio: base64Audio
+          };
+          
+          openaiWs.send(JSON.stringify(audioAppend));
+        }
+      } else {
+        // JSON message from client
+        try {
+          const message = JSON.parse(data.toString());
+          await this.handleClientMessage(conversationKey, conversation, message);
+        } catch (error) {
+          console.error('[RealtimeVoice] Error parsing client message:', error);
+        }
+      }
+    });
+
+    clientWs.on('close', () => {
+      console.log('[RealtimeVoice] Client disconnected');
+      this.cleanup(conversationKey);
+    });
+
+    clientWs.on('error', (error) => {
+      console.error('[RealtimeVoice] Client WebSocket error:', error);
+      this.cleanup(conversationKey);
+    });
+  }
+
+  private async handleClientMessage(
+    conversationKey: string,
+    conversation: VoiceConversation,
+    message: any
+  ) {
+    const { openaiWs } = conversation;
+
+    console.log('[RealtimeVoice] Client message:', message.type);
+
+    switch (message.type) {
+      case 'interrupt':
+        // User interrupted AI - cancel current response
+        console.log('[RealtimeVoice] User interrupted AI');
+        
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          openaiWs.send(JSON.stringify({
+            type: 'response.cancel'
+          }));
+        }
+        
+        conversation.isProcessing = false;
+        break;
+
+      case 'commit_audio':
+        // Manual commit (if not using server VAD)
+        if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
+          openaiWs.send(JSON.stringify({
+            type: 'input_audio_buffer.commit'
+          }));
+        }
+        break;
+
+      default:
+        console.log('[RealtimeVoice] Unknown client message type:', message.type);
+    }
+  }
+
+  private sendToClient(ws: WebSocket, message: any) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(message));
+    }
+  }
+
+  private sendError(ws: WebSocket, message: string) {
+    this.sendToClient(ws, { type: 'error', message });
+  }
+
+  private cleanup(conversationKey: string) {
+    const conversation = this.conversations.get(conversationKey);
+    if (!conversation) return;
+
+    console.log('[RealtimeVoice] Cleaning up conversation:', conversationKey);
+
+    try {
+      // Close OpenAI WebSocket
+      if (conversation.openaiWs) {
+        conversation.openaiWs.close();
+        conversation.openaiWs = null;
+      }
+
+      // Close client WebSocket if still open
+      if (conversation.clientWs && conversation.clientWs.readyState === WebSocket.OPEN) {
+        conversation.clientWs.close();
+      }
+    } catch (error) {
+      console.error('[RealtimeVoice] Cleanup error:', error);
+    }
+
+    this.conversations.delete(conversationKey);
+  }
+}
+
+export const realtimeVoiceService = new RealtimeVoiceService();
